@@ -1,16 +1,7 @@
-package com.toptal.doobie
-
-import doobie.imports._
-import scalaz._, Scalaz._
-import scalaz.stream._
-import scalaz.concurrent.Task
-import java.io.FileWriter
-import scalaz.stream.Process
 import java.sql.Timestamp
-import scala.util.control.Breaks._
-import scopt._
-
-
+import doobie.imports._
+import scalaz.concurrent.Task
+import scalaz.stream.{Process, _}
 
 case class PerformedAction(
   id: Int,
@@ -26,7 +17,6 @@ case class PerformedAction(
   technical_details: Option[String])
 
 object DoobieAvro {
-
   case class Args(
     streaming : Boolean = false,
     pageSize: Int = 10000,
@@ -36,7 +26,7 @@ object DoobieAvro {
 
   val xa = DriverManagerTransactor[Task]("org.postgresql.Driver", "jdbc:postgresql:toptal_development", "toptal", "")
 
-  def performedActionsSelect(offset : Int, limit: Int) =
+  def performedActionsSelect(offset : Int, limit: Int): Query0[PerformedAction] =
     sql"""
     select id,
     subject_id,
@@ -52,6 +42,20 @@ object DoobieAvro {
     from performed_actions where subject_id IS NOT NULL
     offset $offset limit $limit
     """.query[PerformedAction]
+
+  def batchRead(offset: Int, limit: Int): Task[Vector[PerformedAction]] =
+  {
+    println(s"Got batch (offset: $offset)")
+    performedActionsSelect(offset, limit).vector.transact(xa)
+  }
+
+  def batchReadProcess(start: Int, batchSize: Int): Process[Task, PerformedAction] = {
+    Process.await(batchRead(start, batchSize)) { els =>
+      if (els.isEmpty) Process.halt
+      else Process.emitAll(els) ++ batchReadProcess(start + els.size, batchSize)
+    }
+  }
+
 
   def performedActionsSelect2(offset : Int, limit: Int) =
     sql"""
@@ -70,24 +74,23 @@ object DoobieAvro {
     """.query[PerformedAction]
 
   def writeInChunks(outputFilePath: String, pageSize : Int, pages : Int): Unit = {
-    val writer = new FileWriter(outputFilePath, true)
-
-    def writeRecords(page: Int) : Boolean = {
-      val records = performedActionsSelect(page * pageSize, pageSize).list.transact(xa).unsafePerformSync
-      records.foreach { x => writer.append(x.toString) }
-      records.size > 0
-    }
-    Range(0, pages).takeWhile(writeRecords)
-    writer.close()
+    batchReadProcess(0, 1024 * 100)
+      .map(_.toString)
+      .pipe(text.utf8Encode)
+      .to(io.fileChunkW("/tmp/perf_actions.txt", 10 * 1024 * 1024))
+      .run
+      .run
   }
 
   def writeWithStream(outputFilePath: String, pageSize: Int, pages: Int): Unit = {
 
-    performedActionsSelect2(0, pages * pageSize)
+    val proc: Process[ConnectionIO, PerformedAction] = performedActionsSelect(0, pages * pageSize)
       .process
-      .evalMap(_.toString)
-      .to(io.stdOutLines)
+
+    proc
       .transact(xa)
+      .map(_.toString)
+      .to(io.stdOutLines)
       .run
       .run
 
